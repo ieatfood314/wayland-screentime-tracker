@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""screentime — show tracked screen time from the screentime daemon.
+
+Usage:
+  screentime                today's total and per-app breakdown
+  screentime yesterday      same, for yesterday
+  screentime week           per-day totals for the last 7 days
+  screentime history [N]    per-day totals for the last N days (default 14)
+  screentime apps [N]       per-app totals aggregated over the last N days (default 7)
+  screentime sites [N]      per-website totals over the last N days (default 1, i.e. today)
+"""
+
+import datetime as dt
+import os
+import sqlite3
+import sys
+
+DB_PATH = os.path.expanduser("~/.local/share/screentime/screentime.db")
+BAR_WIDTH = 30
+
+PRETTY_NAMES = {
+    "org.kde.dolphin": "Dolphin",
+    "org.kde.konsole": "Konsole",
+    "org.kde.kate": "Kate",
+    "org.kde.okular": "Okular",
+    "org.kde.spectacle": "Spectacle",
+    "org.kde.plasmashell": "Plasma Desktop",
+    "org.kde.systemsettings": "System Settings",
+    "firefox": "Firefox",
+    "zen": "Zen Browser",
+    "chromium": "Chromium",
+    "google-chrome": "Google Chrome",
+    "code": "VS Code",
+    "code-oss": "VS Code",
+    "steam": "Steam",
+    "discord": "Discord",
+    "spotify": "Spotify",
+    "mpv": "mpv",
+    "vlc": "VLC",
+}
+
+
+def pretty(app):
+    if app in PRETTY_NAMES:
+        return PRETTY_NAMES[app]
+    name = app
+    for prefix in ("org.kde.", "org.gnome.", "com.", "io.", "net.", "dev."):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    name = name.split(".")[-1]
+    return name.replace("-", " ").title() if name.islower() else name
+
+
+def fmt_duration(seconds):
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def bar(fraction, width=BAR_WIDTH):
+    filled = round(fraction * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def connect():
+    if not os.path.exists(DB_PATH):
+        sys.exit("No data yet. Is the daemon running?  systemctl --user status screentime")
+    return sqlite3.connect(DB_PATH)
+
+
+def day_label(date_str):
+    d = dt.date.fromisoformat(date_str)
+    today = dt.date.today()
+    if d == today:
+        return "Today"
+    if d == today - dt.timedelta(days=1):
+        return "Yesterday"
+    return d.strftime("%a %b %d")
+
+
+def show_day(date_str):
+    db = connect()
+    rows = db.execute(
+        "SELECT app, seconds FROM usage WHERE date = ? ORDER BY seconds DESC",
+        (date_str,),
+    ).fetchall()
+    if not rows:
+        print(f"No screen time recorded for {day_label(date_str)}.")
+        return
+    total = sum(s for _, s in rows)
+    print(f"\n  {day_label(date_str)} — {fmt_duration(total)} total\n")
+    top = rows[0][1]
+    for app, seconds in rows:
+        if seconds < 10:
+            continue
+        print(f"  {pretty(app):<22.22} {bar(seconds / top)} {fmt_duration(seconds):>7}")
+    print()
+
+
+def show_days(n):
+    db = connect()
+    start = (dt.date.today() - dt.timedelta(days=n - 1)).isoformat()
+    rows = dict(
+        db.execute(
+            "SELECT date, SUM(seconds) FROM usage WHERE date >= ? GROUP BY date",
+            (start,),
+        ).fetchall()
+    )
+    if not rows:
+        print("No screen time recorded in this period.")
+        return
+    top = max(rows.values())
+    print(f"\n  Last {n} days — daily totals\n")
+    for i in range(n - 1, -1, -1):
+        d = (dt.date.today() - dt.timedelta(days=i)).isoformat()
+        seconds = rows.get(d, 0)
+        print(f"  {day_label(d):<12} {bar(seconds / top)} {fmt_duration(seconds):>7}")
+    avg = sum(rows.values()) / len(rows)
+    print(f"\n  Average (days with data): {fmt_duration(avg)}\n")
+
+
+def show_apps(n):
+    db = connect()
+    start = (dt.date.today() - dt.timedelta(days=n - 1)).isoformat()
+    rows = db.execute(
+        "SELECT app, SUM(seconds) AS s FROM usage WHERE date >= ? GROUP BY app ORDER BY s DESC",
+        (start,),
+    ).fetchall()
+    if not rows:
+        print("No screen time recorded in this period.")
+        return
+    total = sum(s for _, s in rows)
+    print(f"\n  Last {n} days — {fmt_duration(total)} total\n")
+    top = rows[0][1]
+    for app, seconds in rows:
+        if seconds < 60:
+            continue
+        print(f"  {pretty(app):<22.22} {bar(seconds / top)} {fmt_duration(seconds):>7}")
+    print()
+
+
+def show_sites(n):
+    db = connect()
+    start = (dt.date.today() - dt.timedelta(days=n - 1)).isoformat()
+    try:
+        rows = db.execute(
+            "SELECT site, SUM(seconds) AS s FROM sites WHERE date >= ? GROUP BY site ORDER BY s DESC",
+            (start,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    if not rows:
+        print("No website time recorded in this period.")
+        return
+    total = sum(s for _, s in rows)
+    label = "Today" if n == 1 else f"Last {n} days"
+    print(f"\n  {label} — websites, {fmt_duration(total)} total\n")
+    top = rows[0][1]
+    for site, seconds in rows:
+        if seconds < 10:
+            continue
+        print(f"  {site:<28.28} {bar(seconds / top)} {fmt_duration(seconds):>7}")
+    print()
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "today"
+
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__.strip())
+    elif cmd == "today":
+        show_day(dt.date.today().isoformat())
+    elif cmd == "yesterday":
+        show_day((dt.date.today() - dt.timedelta(days=1)).isoformat())
+    elif cmd == "week":
+        show_days(7)
+    elif cmd == "history":
+        show_days(int(args[1]) if len(args) > 1 else 14)
+    elif cmd == "apps":
+        show_apps(int(args[1]) if len(args) > 1 else 7)
+    elif cmd == "sites":
+        show_sites(int(args[1]) if len(args) > 1 else 1)
+    else:
+        # allow `screentime 2026-07-01`
+        try:
+            dt.date.fromisoformat(cmd)
+            show_day(cmd)
+        except ValueError:
+            sys.exit(f"Unknown command: {cmd}\n\n{__doc__.strip()}")
+
+
+if __name__ == "__main__":
+    main()

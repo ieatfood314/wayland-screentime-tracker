@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Screen time tracker daemon for KDE Plasma (Wayland).
+
+Injects a KWin script that reports window activations over D-Bus,
+then credits time to the focused app every tick. Pauses while the
+screen is locked. Data lands in a SQLite DB keyed by (date, app).
+"""
+
+import os
+import signal
+import sqlite3
+import sys
+import time
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+BUS_NAME = "dev.aidan.ScreenTime"
+OBJECT_PATH = "/dev/aidan/ScreenTime"
+DATA_DIR = os.path.expanduser("~/.local/share/screentime")
+DB_PATH = os.path.join(DATA_DIR, "screentime.db")
+KWIN_SCRIPT_PATH = os.path.join(DATA_DIR, "tracker.js")
+KWIN_SCRIPT_NAME = "screentime-tracker"
+TICK_SECONDS = 5
+# Ignore gaps longer than this (suspend, daemon stall) instead of crediting them.
+MAX_DELTA = TICK_SECONDS * 3
+
+KWIN_SCRIPT = """\
+var screentimeCurrent = null;
+
+function screentimeSend(win) {
+    callDBus("%(bus)s", "%(path)s", "%(bus)s", "ReportActive",
+             win ? String(win.resourceClass) : "",
+             win ? String(win.caption) : "");
+}
+
+function screentimeCaptionChanged() {
+    screentimeSend(screentimeCurrent);
+}
+
+function screentimeActivated(win) {
+    if (screentimeCurrent) {
+        screentimeCurrent.captionChanged.disconnect(screentimeCaptionChanged);
+    }
+    screentimeCurrent = win;
+    if (win) {
+        win.captionChanged.connect(screentimeCaptionChanged);
+    }
+    screentimeSend(win);
+}
+
+workspace.windowActivated.connect(screentimeActivated);
+screentimeActivated(workspace.activeWindow);
+""" % {"bus": BUS_NAME, "path": OBJECT_PATH}
+
+# Apps whose window titles get site-level tracking. Keyed by resourceClass.
+BROWSERS = {
+    "zen", "firefox", "librewolf", "floorp", "chromium", "google-chrome",
+    "brave-browser", "vivaldi-stable", "microsoft-edge", "opera",
+}
+BROWSER_SUFFIXES = (
+    "zen browser", "zen", "mozilla firefox", "firefox", "librewolf", "floorp",
+    "chromium", "google chrome", "brave", "vivaldi", "microsoft edge", "opera",
+    "mozilla firefox private browsing", "private browsing",
+)
+TITLE_SEPARATORS = (" — ", " – ", " - ", " | ", " · ")
+
+
+def site_from_caption(caption):
+    """Best-effort site name from a browser window title.
+
+    Titles look like "Video Name - YouTube — Zen Browser"; we split on common
+    separators, drop the browser suffix, and take the last segment (usually
+    the site name). Title-based, so it's a heuristic, not a URL.
+    """
+    parts = [caption]
+    for sep in TITLE_SEPARATORS:
+        parts = [p for chunk in parts for p in chunk.split(sep)]
+    parts = [p.strip() for p in parts if p.strip()]
+    while parts and parts[-1].lower() in BROWSER_SUFFIXES:
+        parts.pop()
+    return parts[-1] if parts else "(untitled)"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+class Store:
+    def __init__(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.db = sqlite3.connect(path)
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS usage (
+                   date TEXT NOT NULL,
+                   app TEXT NOT NULL,
+                   seconds REAL NOT NULL DEFAULT 0,
+                   PRIMARY KEY (date, app)
+               )"""
+        )
+        self.db.execute(
+            """CREATE TABLE IF NOT EXISTS sites (
+                   date TEXT NOT NULL,
+                   site TEXT NOT NULL,
+                   seconds REAL NOT NULL DEFAULT 0,
+                   PRIMARY KEY (date, site)
+               )"""
+        )
+        self.db.commit()
+
+    def add(self, app, site, seconds):
+        today = time.strftime("%Y-%m-%d")
+        self.db.execute(
+            """INSERT INTO usage (date, app, seconds) VALUES (?, ?, ?)
+               ON CONFLICT(date, app) DO UPDATE SET seconds = seconds + excluded.seconds""",
+            (today, app, seconds),
+        )
+        if site:
+            self.db.execute(
+                """INSERT INTO sites (date, site, seconds) VALUES (?, ?, ?)
+                   ON CONFLICT(date, site) DO UPDATE SET seconds = seconds + excluded.seconds""",
+                (today, site, seconds),
+            )
+        self.db.commit()
+
+
+class Tracker(dbus.service.Object):
+    def __init__(self, bus):
+        self.bus = bus
+        bus_name = dbus.service.BusName(BUS_NAME, bus=bus)
+        super().__init__(bus_name, OBJECT_PATH)
+
+        self.store = Store(DB_PATH)
+        self.current_app = ""
+        self.current_site = ""
+        self.locked = self._query_locked()
+        self.last_tick = time.monotonic()
+
+        self._setup_lock_watch()
+        # (Re)inject the KWin script whenever KWin (re)appears on the bus.
+        self.bus.watch_name_owner("org.kde.KWin", self._on_kwin_owner_changed)
+        GLib.timeout_add_seconds(TICK_SECONDS, self._tick)
+
+    @dbus.service.method(BUS_NAME, in_signature="ss")
+    def ReportActive(self, app, caption):
+        app = str(app).strip()
+        site = site_from_caption(str(caption)) if app in BROWSERS else ""
+        if app != self.current_app or site != self.current_site:
+            self._credit()
+            self.current_app = app
+            self.current_site = site
+
+    def _query_locked(self):
+        try:
+            ss = self.bus.get_object("org.freedesktop.ScreenSaver", "/ScreenSaver")
+            return bool(ss.GetActive(dbus_interface="org.freedesktop.ScreenSaver"))
+        except dbus.DBusException:
+            return False
+
+    def _setup_lock_watch(self):
+        self.bus.add_signal_receiver(
+            self._on_lock_changed,
+            signal_name="ActiveChanged",
+            dbus_interface="org.freedesktop.ScreenSaver",
+            path="/ScreenSaver",
+        )
+
+    def _on_lock_changed(self, active):
+        self._credit()
+        self.locked = bool(active)
+        log(f"screen {'locked' if self.locked else 'unlocked'}")
+
+    def _on_kwin_owner_changed(self, owner):
+        if owner:
+            # Give KWin's scripting engine a moment to come up after restart.
+            GLib.timeout_add_seconds(2, self._load_kwin_script)
+
+    def _load_kwin_script(self):
+        try:
+            with open(KWIN_SCRIPT_PATH, "w") as f:
+                f.write(KWIN_SCRIPT)
+            kwin = self.bus.get_object("org.kde.KWin", "/Scripting")
+            iface = dbus.Interface(kwin, "org.kde.kwin.Scripting")
+            if iface.isScriptLoaded(KWIN_SCRIPT_NAME):
+                iface.unloadScript(KWIN_SCRIPT_NAME)
+            # loadScript is overloaded; force the (path, pluginName) variant.
+            iface.loadScript(KWIN_SCRIPT_PATH, KWIN_SCRIPT_NAME, signature="ss")
+            iface.start()
+            log("KWin tracker script loaded")
+        except dbus.DBusException as e:
+            log(f"failed to load KWin script, retrying in 10s: {e}")
+            GLib.timeout_add_seconds(10, self._load_kwin_script)
+        return False  # one-shot timeout
+
+    def _credit(self):
+        """Credit elapsed time since last tick to the current app."""
+        now = time.monotonic()
+        delta = now - self.last_tick
+        self.last_tick = now
+        if delta <= 0 or delta > MAX_DELTA:
+            return
+        if self.locked or not self.current_app:
+            return
+        self.store.add(self.current_app, self.current_site, delta)
+
+    def _tick(self):
+        self._credit()
+        return True
+
+    def shutdown(self):
+        self._credit()
+        try:
+            kwin = self.bus.get_object("org.kde.KWin", "/Scripting")
+            dbus.Interface(kwin, "org.kde.kwin.Scripting").unloadScript(KWIN_SCRIPT_NAME)
+        except dbus.DBusException:
+            pass
+
+
+def main():
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+    tracker = Tracker(bus)
+    loop = GLib.MainLoop()
+
+    def stop(*_):
+        tracker.shutdown()
+        loop.quit()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, stop)
+
+    log("screentime daemon started")
+    loop.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
