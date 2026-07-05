@@ -1,45 +1,54 @@
-# Wayland screen time tracker
+# waytime
 
 Per-app and per-website screen time tracking for KDE Plasma (Wayland), with a CLI viewer.
 
 ## How it works
 
-- [screentime_daemon.py](screentime_daemon.py) runs as a systemd user service. It
-  injects a small KWin script (via the `org.kde.kwin.Scripting` D-Bus interface)
-  that reports every window activation back to the daemon. Every 5 seconds the
+- `waytime-daemon` runs as a systemd user service. It injects a small KWin
+  script (via the `org.kde.kwin.Scripting` D-Bus interface) that reports every
+  window activation and title change back to the daemon. Every 5 seconds the
   daemon credits elapsed time to the focused app in a SQLite database at
-  `~/.local/share/screentime/screentime.db`.
-- For browser windows (Zen, Firefox, Chromium, etc.) the daemon also watches the
-  window title and credits time to a per-website table. The site name is parsed
-  from the title (e.g. "Video - YouTube — Zen Browser" → "YouTube") — it's a
-  heuristic, not a real URL; pages whose titles omit the site name get odd labels.
+  `~/.local/share/waytime/waytime.db`.
+- For browser windows (Zen, Firefox, Chromium, etc.) the daemon also parses the
+  site name out of the window title (e.g. "Video - YouTube — Zen Browser" →
+  "YouTube") and keeps a per-website table. It's a heuristic, not a URL —
+  pages whose titles omit the site name get odd labels.
 - Tracking pauses while the screen is locked, and suspend gaps are not counted.
 - If KWin restarts, the daemon re-injects the tracker script automatically.
 - History is kept forever (the DB grows by a few KB per day).
 
+Requires KDE Plasma 6 on Wayland — the daemon talks to KWin's scripting
+interface, so other compositors (Hyprland, Sway, GNOME) would need their own
+tracking backend.
+
+## Install
+
+From the AUR:
+
+```
+yay -S waytime        # or paru, or makepkg -si from a clone
+systemctl --user enable --now waytime
+```
+
+This installs `waytime` (CLI) and `waytime-daemon` to `/usr/bin`, and the
+user service to `/usr/lib/systemd/user/waytime.service`.
+
 ## Usage
 
 ```
-screentime                today's total and per-app breakdown
-screentime yesterday      same, for yesterday
-screentime week           per-day totals for the last 7 days
-screentime history [N]    per-day totals for the last N days (default 14)
-screentime apps [N]       per-app totals over the last N days (default 7)
-screentime sites [N]      per-website totals over the last N days (default: today)
-screentime 2026-07-01     breakdown for a specific date
+waytime                today's total and per-app breakdown
+waytime yesterday      same, for yesterday
+waytime week           per-day totals for the last 7 days
+waytime history [N]    per-day totals for the last N days (default 14)
+waytime apps [N]       per-app totals over the last N days (default 7)
+waytime sites [N]      per-website totals over the last N days (default: today)
+waytime 2026-07-01     breakdown for a specific date
 ```
-
-## Install layout
-
-- `~/.local/bin/screentime` → symlink to [screentime](screentime) (the CLI)
-- `~/.config/systemd/user/screentime.service` → symlink to
-  [screentime.service](screentime.service), enabled via
-  `systemctl --user enable --now screentime`
 
 ## Service management
 
 ```
-systemctl --user status screentime     # check the daemon
-journalctl --user -u screentime -f     # follow its logs
-systemctl --user restart screentime    # restart after editing the daemon
+systemctl --user status waytime     # check the daemon
+journalctl --user -u waytime -f     # follow its logs
+systemctl --user restart waytime    # restart after an update
 ```

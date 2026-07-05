@@ -17,42 +17,42 @@ import dbus.mainloop.glib
 import dbus.service
 from gi.repository import GLib
 
-BUS_NAME = "dev.aidan.ScreenTime"
-OBJECT_PATH = "/dev/aidan/ScreenTime"
-DATA_DIR = os.path.expanduser("~/.local/share/screentime")
-DB_PATH = os.path.join(DATA_DIR, "screentime.db")
+BUS_NAME = "org.waytime.Tracker"
+OBJECT_PATH = "/org/waytime/Tracker"
+DATA_DIR = os.path.expanduser("~/.local/share/waytime")
+DB_PATH = os.path.join(DATA_DIR, "waytime.db")
 KWIN_SCRIPT_PATH = os.path.join(DATA_DIR, "tracker.js")
-KWIN_SCRIPT_NAME = "screentime-tracker"
+KWIN_SCRIPT_NAME = "waytime-tracker"
 TICK_SECONDS = 5
 # Ignore gaps longer than this (suspend, daemon stall) instead of crediting them.
 MAX_DELTA = TICK_SECONDS * 3
 
 KWIN_SCRIPT = """\
-var screentimeCurrent = null;
+var waytimeCurrent = null;
 
-function screentimeSend(win) {
+function waytimeSend(win) {
     callDBus("%(bus)s", "%(path)s", "%(bus)s", "ReportActive",
              win ? String(win.resourceClass) : "",
              win ? String(win.caption) : "");
 }
 
-function screentimeCaptionChanged() {
-    screentimeSend(screentimeCurrent);
+function waytimeCaptionChanged() {
+    waytimeSend(waytimeCurrent);
 }
 
-function screentimeActivated(win) {
-    if (screentimeCurrent) {
-        screentimeCurrent.captionChanged.disconnect(screentimeCaptionChanged);
+function waytimeActivated(win) {
+    if (waytimeCurrent) {
+        waytimeCurrent.captionChanged.disconnect(waytimeCaptionChanged);
     }
-    screentimeCurrent = win;
+    waytimeCurrent = win;
     if (win) {
-        win.captionChanged.connect(screentimeCaptionChanged);
+        win.captionChanged.connect(waytimeCaptionChanged);
     }
-    screentimeSend(win);
+    waytimeSend(win);
 }
 
-workspace.windowActivated.connect(screentimeActivated);
-screentimeActivated(workspace.activeWindow);
+workspace.windowActivated.connect(waytimeActivated);
+waytimeActivated(workspace.activeWindow);
 """ % {"bus": BUS_NAME, "path": OBJECT_PATH}
 
 # Apps whose window titles get site-level tracking. Keyed by resourceClass.
@@ -231,7 +231,7 @@ def main():
     for sig in (signal.SIGTERM, signal.SIGINT):
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, stop)
 
-    log("screentime daemon started")
+    log("waytime daemon started")
     loop.run()
 
 
